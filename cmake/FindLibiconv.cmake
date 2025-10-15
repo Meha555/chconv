@@ -1,0 +1,11 @@
+set(ICONV_LIB)
+if(WIN32)
+    find_package(Iconv REQUIRED)
+    if(TARGET Iconv::Iconv)
+        set(ICONV_LIB Iconv::Iconv)
+    endif()
+else()
+    find_library(ICONV_LIB NAMES iconv)
+endif()
+
+set(ICONV_VERSION "1.18")

@@ -1,0 +1,11 @@
+set(CHARDET_LIB)
+if(WIN32)
+    find_package(uchardet CONFIG REQUIRED)
+    if(TARGET uchardet::libuchardet)
+        set(CHARDET_LIB uchardet::libuchardet)
+    endif()
+else()
+    find_library(CHARDET_LIB NAMES uchardet)
+endif()
+
+set(CHARDET_VERSION "0.0.8")

@@ -1,0 +1,324 @@
+#include <cstdarg>
+#include <cstring>
+#include <errno.h>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <optional>
+
+#include "cmdline.h"
+#include <iconv.h>
+#include <uchardet.h>
+
+#include "version.h"
+
+namespace fs = std::filesystem;
+
+namespace
+{
+struct guard_t
+{
+    guard_t()
+    {
+        cd = uchardet_new();
+    }
+    ~guard_t()
+    {
+        uchardet_delete(cd);
+    }
+    uchardet_t cd;
+};
+}
+
+static const char *render_string(const char *fmt, ...)
+{
+    static char buf[64] = {0};
+    va_list args;
+    va_start(args, fmt);
+    std::vsprintf(buf, fmt, args);
+    va_end(args);
+    return buf;
+}
+
+static struct options
+{
+    bool verbose = false;
+    bool dry_run = false;
+    bool recursive = false;
+    fs::path input;
+    fs::path output;
+    std::optional<std::string> suffix;
+    std::optional<std::string> to;
+
+    guard_t guard;
+
+    void init(int argc, char *argv[])
+    {
+        // clang-format off
+        parser.program_name("chconv");
+        parser.introduction("file encoding converter");
+        parser.flag("verbose", 'v', "print verbose output");
+        parser.flag("recursive", 'r', "process directories recursively");
+        parser.flag("dry-run", 'd', "just print files to be converted and do noting");
+        parser.option<std::string>("input", 'i', "input file or directory", true);
+        parser.option<std::string>("output", 'o', "output file or directory", true);
+        parser.option<std::string>("suffix", 's', "include file's suffix", false);
+        parser.option_with_default<std::string>("to", 't',
+            cmdline::description(
+                "encoding of output file",
+                R"(see https://www.gnu.org/savannah-checkouts/gnu/libiconv/ for more information)"),
+            false, "UTF-8");
+        parser.version(render_string("%s (libuchardet@%s, libiconv@%s)",
+                                     CHCONV_VERSION,
+                                     LIBCHARDET_VERSION,
+                                     LIBICONV_VERSION));
+        // clang-format on
+        parser.parse_check(argc, argv);
+
+        // flags
+        verbose = parser.exist("verbose");
+        recursive = parser.exist("recursive");
+        dry_run = parser.exist("dry-run");
+        // required options
+        input = parser.get<std::string>("input");
+        output = parser.get<std::string>("output");
+        // optional options
+        if (parser.exist("suffix")) {
+            suffix = parser.get<std::string>("suffix");
+        }
+        // options with default value
+        to = parser.get<std::string>("to");
+    }
+
+private:
+    cmdline::parser parser;
+} g;
+
+static void log(const char *fmt, ...)
+{
+    if (g.verbose) {
+        va_list args;
+        va_start(args, fmt);
+        std::vfprintf(stderr, fmt, args);
+        va_end(args);
+    }
+}
+
+static std::string detect_encoding(const fs::path &filename)
+{
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        throw std::runtime_error("cannot open file: " + filename.string());
+    }
+
+    const std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<char> buffer(size);
+    if (!file.read(buffer.data(), size)) {
+        throw std::runtime_error("failed to read: " + filename.string());
+    }
+
+    // NOTE uchardet_reset的调用会修改uchardet_get_charset返回的字符串地址，
+    // 所以在使用uchardet_get_charset返回的临时地址时，不能调用uchardet_reset
+    // 因此将uchardet_reset放到最前面调用
+    uchardet_reset(g.guard.cd);
+    uchardet_handle_data(g.guard.cd, buffer.data(), buffer.size());
+    uchardet_data_end(g.guard.cd);
+
+    const char *encoding = uchardet_get_charset(g.guard.cd);
+    if (std::strcmp(encoding, "") == 0) {
+        throw std::runtime_error("unrecognized encoding of file: " + filename.string());
+    }
+    return encoding;
+}
+
+static bool convert_encoding(const fs::path &input_filename,
+                             const std::string &from_encoding,
+                             const fs::path &output_filename,
+                             const std::string &to_encoding)
+{
+    std::ifstream input_file(input_filename, std::ios::binary);
+    if (!input_file.is_open()) {
+        std::cerr << "cannot open file: " << input_filename << std::endl;
+        return false;
+    }
+
+    input_file.seekg(0, std::ios::end);
+    const std::streamsize size = input_file.tellg();
+
+    input_file.seekg(0, std::ios::beg);
+    std::vector<char> input_buffer(size);
+    if (!input_file.read(input_buffer.data(), size)) {
+        std::cerr << "failed to read: " << input_filename << std::endl;
+        return false;
+    }
+
+    iconv_t cd = iconv_open(to_encoding.c_str(), from_encoding.c_str());
+    if (cd == (iconv_t)-1) {
+        std::cerr << "cannot convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << "): " << std::strerror(errno) << "(" << errno << ")" << std::endl;
+        return false;
+    }
+
+    // NOTE 分配输出缓冲区 (通常比输入大一些，因为编码可能扩充)
+    size_t output_buffer_size = input_buffer.size() << 1;
+    std::vector<char> output_buffer(output_buffer_size);
+
+    char *in_ptr = input_buffer.data();
+    size_t in_left = input_buffer.size();
+    char *out_ptr = output_buffer.data();
+    size_t out_left = output_buffer_size;
+
+    size_t result = iconv(cd, &in_ptr, &in_left, &out_ptr, &out_left);
+    if (result == (size_t)-1) {
+        std::cerr << "convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << std::strerror(errno) << "(" << errno << ")" << std::endl;
+        iconv_close(cd);
+        return false;
+    }
+
+    iconv_close(cd);
+
+    std::ofstream output_file(output_filename, std::ios::binary);
+    if (!output_file.is_open()) {
+        std::cerr << "cannot open file: " << output_filename << std::endl;
+        return false;
+    }
+
+    output_file.write(output_buffer.data(), output_buffer_size - out_left);
+    return true;
+}
+
+static bool process_file(const fs::path &input_path, const fs::path &output_path)
+{
+    try {
+        // detect file encoding
+        const std::string file_encoding = detect_encoding(input_path);
+        log("%s: %s\n", input_path.string().c_str(), file_encoding.c_str());
+
+        if (g.dry_run) {
+            std::cerr << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")" << std::endl;
+            return true;
+        }
+
+        fs::create_directories(fs::path(output_path).parent_path());
+
+        if (convert_encoding(input_path, file_encoding, output_path, g.to.value())) {
+            if (g.verbose) {
+                std::cerr << "converted: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")" << std::endl;
+            }
+            return true;
+        }
+        return false;
+    } catch (const std::exception &ex) {
+        std::cerr << "convert failed for " << input_path << ": " << ex.what() << std::endl;
+        return false;
+    }
+}
+
+static bool process_directory(const fs::path &input_dir, const fs::path &output_dir)
+{
+    try {
+        bool has_processed_file = false;
+
+        if (g.recursive) {
+            for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
+                if (entry.is_regular_file()) {
+                    const fs::path input_path = entry.path();
+                    // use relative path to keep the directory structure
+                    const fs::path relative_path = fs::relative(entry.path(), input_dir);
+
+                    // Check suffix if specified
+                    if (g.suffix.has_value()) {
+                        if (input_path.extension() != g.suffix.value()) {
+                            continue;
+                        }
+                    }
+
+                    has_processed_file = true;
+                    const fs::path output_path = fs::path(output_dir) / relative_path;
+
+                    if (!process_file(input_path, output_path)) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for (const auto &entry : fs::directory_iterator(input_dir)) {
+                if (entry.is_regular_file()) {
+                    const fs::path input_path = entry.path();
+                    const fs::path filename = entry.path().filename();
+
+                    // Check suffix if specified
+                    if (g.suffix.has_value()) {
+                        if (input_path.extension() != g.suffix.value()) {
+                            continue;
+                        }
+                    }
+
+                    has_processed_file = true;
+                    const fs::path output_path = fs::path(output_dir) / filename;
+
+                    if (!process_file(input_path, output_path)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if (!has_processed_file) {
+            if (g.suffix) {
+                std::cerr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << std::endl;
+            } else {
+                std::cerr << "no file processed in: " << input_dir << std::endl;
+            }
+        }
+        return true;
+    } catch (const std::exception &ex) {
+        std::cerr << "directory processing failed: " << ex.what() << std::endl;
+        return false;
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    try {
+        g.init(argc, argv);
+        std::cerr << "convert start...\n";
+
+        g.input = fs::absolute(g.input);
+        g.output = fs::absolute(g.output);
+
+        if (!fs::exists(g.input)) {
+            std::cerr << "input file or directory does not exist: " << g.input << std::endl;
+            return 1;
+        }
+
+        // Check if input is directory
+        if (fs::is_directory(g.input)) {
+            if (!process_directory(g.input, g.output)) {
+                std::cerr << "convert failed\n";
+                return 1;
+            }
+        } else {
+            // Process single file
+            // Check suffix if specified
+            if (g.suffix.has_value()) {
+                if (g.input.extension() != g.suffix.value()) {
+                    std::cerr << "input file does not match specified suffix\n";
+                    return 1;
+                }
+            }
+
+            if (!process_file(g.input, g.output)) {
+                std::cerr << "convert failed\n";
+                return 1;
+            }
+        }
+
+        std::cerr << "convert done.\n";
+        return 0;
+    } catch (const std::exception &ex) {
+        std::cerr << "convert failed: " << ex.what() << std::endl;
+        return 1;
+    }
+}
