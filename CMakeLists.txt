@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(LINKING_STATIC "Linking static" ON)
 
-project(chconv VERSION 1.0.0)
+project(chconv VERSION 1.1.0)
 
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/out)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/out)
@@ -19,7 +19,7 @@ if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "Clang" OR CMAKE_CXX_SIMULATE_ID STREQ
 endif()
 
 include(FetchContent)
-include(ExternalProject)
+# include(ExternalProject)
 
 include(cmake/FindLibchardet.cmake) # Using uchardet
 include(cmake/FindLibiconv.cmake)

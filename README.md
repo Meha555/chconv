@@ -41,7 +41,8 @@ chconv [options] -i <input file/directory> -o <output file/directory>
 | --verbose | -v | Show detailed output |
 | --recursive | -r | Recursively process directories |
 | --dry-run | -d | Show operations to be performed without actually converting |
-| --suffix | -s | Specify file suffix to process |
+| --suffix | -s | Specify file suffix to process (supports regular expressions, multiple patterns separated by ';') |
+| --exclude | | Exclude files, suffixes or directories from processing using regular expressions (separated by ';') |
 
 ### Examples
 
@@ -64,6 +65,33 @@ chconv [options] -i <input file/directory> -o <output file/directory>
    ```bash
    chconv -r -d -i ./source -o ./target
    ```
+
+5. Convert files while excluding specific files, suffixes or directories using regular expressions:
+   ```bash
+   chconv -r --exclude ".*\.log$|.*\.tmp$|node_modules|\.git" -i ./source_dir -o ./target_dir
+   ```
+
+### Regular Expression Usage
+
+Both `--exclude` and `--suffix` options support regular expressions for more flexible file and directory matching.
+
+For the `--exclude` option:
+
+- `.*\.log$` - Matches all files with .log extension
+- `node_modules` - Matches any path containing "node_modules"
+- `\.git` - Matches any path containing ".git"
+- `.*\.(tmp|temp)$` - Matches files with .tmp or .temp extensions
+
+For the `--suffix` option:
+
+- `\.log$` - Matches all files with .log extension
+- `\.log$|\.txt$` - Matches files with .log or .txt extensions
+- `log$` - Matches all files whose names end with "log" (including .log files)
+- `\.log$;\.tmp$` - Matches files with either .log or .tmp extension (using ';' separator)
+
+When using regular expressions with the `--suffix` option, patterns are matched against both the full extension (including the dot) and the extension without the dot.
+
+Multiple patterns can be combined using the `|` (OR) operator within a single expression or separated by `;` as individual expressions.
 
 ## Supported Encoding Formats
 

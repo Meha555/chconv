@@ -5,6 +5,8 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <regex>
+#include <sstream>
 
 #include "cmdline.h"
 #include <iconv.h>
@@ -49,6 +51,7 @@ static struct options
     fs::path output;
     std::optional<std::string> suffix;
     std::optional<std::string> to;
+    std::optional<std::string> exclude;
 
     guard_t guard;
 
@@ -60,9 +63,10 @@ static struct options
         parser.flag("verbose", 'v', "print verbose output");
         parser.flag("recursive", 'r', "process directories recursively");
         parser.flag("dry-run", 'd', "just print files to be converted and do noting");
-        parser.option<std::string>("input", 'i', "input file or directory", true);
-        parser.option<std::string>("output", 'o', "output file or directory", true);
-        parser.option<std::string>("suffix", 's', "include file's suffix", false);
+        parser.option<std::string>("input", 'i', "input filename or directory", true);
+        parser.option<std::string>("output", 'o', "output filename or directory", true);
+        parser.option<std::string>("suffix", 's', cmdline::description("included file suffixes", "matched by regex or string and split by ';'"), false);
+        parser.option<std::string>("exclude", 'e', cmdline::description("excluded filenames, suffixes or dirs", "matched by regex or string and split by ';'"), false);
         parser.option_with_default<std::string>("to", 't',
             cmdline::description(
                 "encoding of output file",
@@ -86,6 +90,9 @@ static struct options
         if (parser.exist("suffix")) {
             suffix = parser.get<std::string>("suffix");
         }
+        if (parser.exist("exclude")) {
+            exclude = parser.get<std::string>("exclude");
+        }
         // options with default value
         to = parser.get<std::string>("to");
     }
@@ -93,6 +100,121 @@ static struct options
 private:
     cmdline::parser parser;
 } g;
+
+static std::vector<std::string> split_string(const std::string &str, char delimiter)
+{
+    std::vector<std::string> tokens;
+    std::stringstream ss(str);
+    std::string token;
+
+    while (std::getline(ss, token, delimiter)) {
+        if (!token.empty()) {
+            tokens.push_back(token);
+        }
+    }
+
+    return tokens;
+}
+
+static bool should_exclude(const fs::path &path)
+{
+    // if no exclude specified, do not exclude anything
+    if (!g.exclude) {
+        return false;
+    }
+
+    const std::string path_str = path.string();
+    const std::string filename = path.filename().string();
+    const std::string extension = path.extension().string();
+
+    // Split exclude patterns by ';'
+    const std::vector<std::string> patterns = split_string(g.exclude.value(), ';');
+
+    for (const auto &pattern : patterns) {
+        try {
+            std::regex regex_pattern(pattern);
+
+            if (std::regex_search(path_str, regex_pattern) || // directory
+                std::regex_search(filename, regex_pattern) // filename
+            ) {
+                return true;
+            }
+
+            if (!extension.empty()) {
+                if (std::regex_search(extension, regex_pattern) || // extension with dot
+                    std::regex_search(extension.substr(1), regex_pattern) // extension without dot
+                ) {
+                    return true;
+                }
+            }
+
+            // Check if pattern matches any directory component
+            for (const auto &part : path) {
+                if (std::regex_search(part.string(), regex_pattern)) {
+                    return true;
+                }
+            }
+        } catch (const std::regex_error &ex) {
+            // If regex_pattern is invalid, fall back to simple string matching
+            if (path_str.find(pattern) != std::string::npos || // is directory
+                filename.find(pattern) != std::string::npos || // is filename
+                (!extension.empty() && extension == pattern)) { // is file's suffix
+                return true;
+            }
+
+            // Check if pattern is a directory name and matches a parent directory
+            if (fs::is_directory(path)) {
+                for (const auto &part : path) {
+                    if (part.string() == pattern) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool should_include_suffix(const fs::path &path)
+{
+    // if no suffix specified, include all files
+    if (!g.suffix) {
+        return true;
+    }
+
+    const std::string extension = path.extension().string();
+
+    // if file has no extension but we specified --sufix, exclude it
+    if (extension.empty()) {
+        return false;
+    }
+
+    // Split suffix patterns by ';'
+    const std::vector<std::string> patterns = split_string(g.suffix.value(), ';');
+
+    for (const auto &pattern : patterns) {
+        try {
+            std::regex regex_pattern(pattern);
+
+            // Check if the file extension matches the regex_pattern
+            if (std::regex_search(extension, regex_pattern) || // extension with dot
+                std::regex_search(extension.substr(1), regex_pattern) // extension without dot
+            ) {
+                return true;
+            }
+        } catch (const std::regex_error &ex) {
+            // If the regex_pattern is invalid, revert to simple string matching.
+            if (extension == pattern || // full extension string with dot
+                extension.substr(1) == pattern // full extension string without dot
+            ) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
 
 static void log(const char *fmt, ...)
 {
@@ -222,14 +344,19 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
 
         if (g.recursive) {
             for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
+                // Check if the entry should be excluded
+                if (should_exclude(entry.path())) {
+                    continue;
+                }
+
                 if (entry.is_regular_file()) {
                     const fs::path input_path = entry.path();
                     // use relative path to keep the directory structure
                     const fs::path relative_path = fs::relative(entry.path(), input_dir);
 
                     // Check suffix if specified
-                    if (g.suffix.has_value()) {
-                        if (input_path.extension() != g.suffix.value()) {
+                    if (g.suffix) {
+                        if (!should_include_suffix(input_path)) {
                             continue;
                         }
                     }
@@ -244,13 +371,18 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
             }
         } else {
             for (const auto &entry : fs::directory_iterator(input_dir)) {
+                // Check if the entry should be excluded
+                if (should_exclude(entry.path())) {
+                    continue;
+                }
+
                 if (entry.is_regular_file()) {
                     const fs::path input_path = entry.path();
                     const fs::path filename = entry.path().filename();
 
                     // Check suffix if specified
-                    if (g.suffix.has_value()) {
-                        if (input_path.extension() != g.suffix.value()) {
+                    if (g.suffix) {
+                        if (!should_include_suffix(input_path)) {
                             continue;
                         }
                     }
@@ -299,12 +431,13 @@ int main(int argc, char *argv[])
                 std::cerr << "convert failed\n";
                 return 1;
             }
-        } else {
-            // Process single file
+        }
+        // Process single file
+        else {
             // Check suffix if specified
-            if (g.suffix.has_value()) {
-                if (g.input.extension() != g.suffix.value()) {
-                    std::cerr << "input file does not match specified suffix\n";
+            if (g.suffix) {
+                if (!should_include_suffix(g.input)) {
+                    std::cerr << "input file does not match any specified suffix\n";
                     return 1;
                 }
             }
