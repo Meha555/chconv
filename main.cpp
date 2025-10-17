@@ -1,12 +1,18 @@
+#include <condition_variable>
 #include <cstdarg>
 #include <cstring>
 #include <errno.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <regex>
 #include <sstream>
+#include <thread>
+#include <vector>
+
 
 #include "cmdline.h"
 #include <iconv.h>
@@ -18,6 +24,85 @@ namespace fs = std::filesystem;
 
 namespace
 {
+
+// 并行任务处理器类
+class ParallelProcessor
+{
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<bool()>> tasks;
+    mutable std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+    std::atomic<bool> has_error{false};
+    const unsigned int num_threads = std::thread::hardware_concurrency() ? 0 : 2;
+
+public:
+    ParallelProcessor()
+        : stop(false)
+    {
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<bool()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] {
+                            return this->stop || !this->tasks.empty();
+                        });
+
+                        if (this->stop && this->tasks.empty()) {
+                            return;
+                        }
+
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+
+                    if (!task()) {
+                        this->has_error = true;
+                    }
+                }
+            });
+        }
+    }
+
+    ~ParallelProcessor()
+    {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    template<class F>
+    void enqueue(F &&f)
+    {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+
+            // Don't allow enqueueing after stopping the pool
+            if (stop) {
+                throw std::runtime_error("enqueue on stopped ParallelProcessor");
+            }
+
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    bool has_failed() const
+    {
+        return has_error.load();
+    }
+};
 struct guard_t
 {
     guard_t()
@@ -216,9 +301,46 @@ static bool should_include_suffix(const fs::path &path)
     return false;
 }
 
+// 线程安全的日志类
+class ThreadSafeLogger
+{
+    friend void log(const char *fmt, ...);
+    mutable std::mutex log_mutex;
+
+public:
+    // 模板函数，用于线程安全地打印日志
+    template<typename... Args>
+    void log(const char *format, Args... args) const
+    {
+        if (g.verbose) {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::fprintf(stderr, format, args...);
+        }
+    }
+
+    // 重载函数调用操作符，方便使用
+    template<typename... Args>
+    void operator()(const char *format, Args... args) const
+    {
+        log(format, args...);
+    }
+
+    // 线程安全地打印错误信息
+    template<typename... Args>
+    void error(const char *format, Args &&...args) const
+    {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::fprintf(stderr, format, std::forward<Args>(args)...);
+    }
+};
+
+// 全局日志实例
+static const ThreadSafeLogger logger;
+
 static void log(const char *fmt, ...)
 {
     if (g.verbose) {
+        std::lock_guard<std::mutex> lock(logger.log_mutex);
         va_list args;
         va_start(args, fmt);
         std::vfprintf(stderr, fmt, args);
@@ -315,34 +437,37 @@ static bool process_file(const fs::path &input_path, const fs::path &output_path
     try {
         // detect file encoding
         const std::string file_encoding = detect_encoding(input_path);
-        log("%s: %s\n", input_path.string().c_str(), file_encoding.c_str());
+        logger("%s: %s\n", input_path.string().c_str(), file_encoding.c_str());
 
         if (g.dry_run) {
-            std::cerr << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")" << std::endl;
+            logger.error("would convert: %s(%s) -> %s(%s)\n",
+                         input_path.string().c_str(), file_encoding.c_str(),
+                         output_path.string().c_str(), g.to.value().c_str());
             return true;
         }
 
         fs::create_directories(fs::path(output_path).parent_path());
 
         if (convert_encoding(input_path, file_encoding, output_path, g.to.value())) {
-            if (g.verbose) {
-                std::cerr << "converted: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")" << std::endl;
-            }
+            logger.error("converted: %s(%s) -> %s(%s)\n",
+                         input_path.string().c_str(), file_encoding.c_str(),
+                         output_path.string().c_str(), g.to.value().c_str());
             return true;
         }
         return false;
     } catch (const std::exception &ex) {
-        std::cerr << "convert failed for " << input_path << ": " << ex.what() << std::endl;
+        logger.error("convert failed for %s: %s\n", input_path.string().c_str(), ex.what());
         return false;
     }
 }
 
 static bool process_directory(const fs::path &input_dir, const fs::path &output_dir)
 {
-    bool has_failed = false;
     bool has_processed_file = false;
-    try {
+    std::vector<std::pair<fs::path, fs::path>> file_pairs; // <input_path, output_path>
 
+    try {
+        // 收集所有需要处理的文件
         if (g.recursive) {
             for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
                 // Check if the entry should be excluded
@@ -364,10 +489,7 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
 
                     has_processed_file = true;
                     const fs::path output_path = fs::path(output_dir) / relative_path;
-
-                    if (!process_file(input_path, output_path)) {
-                        has_failed = true;
-                    }
+                    file_pairs.emplace_back(input_path, output_path);
                 }
             }
         } else {
@@ -390,24 +512,32 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
 
                     has_processed_file = true;
                     const fs::path output_path = fs::path(output_dir) / filename;
-
-                    if (!process_file(input_path, output_path)) {
-                        has_failed = true;
-                    }
+                    file_pairs.emplace_back(input_path, output_path);
                 }
             }
         }
 
         if (!has_processed_file) {
             if (g.suffix) {
-                std::cerr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << std::endl;
+                logger.error("no file processed with suffix: \"%s\" in: %s\n", g.suffix.value().c_str(), input_dir.string().c_str());
             } else {
-                std::cerr << "no file processed in: " << input_dir << std::endl;
+                logger.error("no file processed in: %s\n", input_dir.string().c_str());
             }
+            return true;
         }
-        return true;
+
+        ParallelProcessor processor;
+
+        for (const auto &file_pair : file_pairs) {
+            processor.enqueue([file_pair]() {
+                return process_file(file_pair.first, file_pair.second);
+            });
+        }
+
+        // 等待所有任务完成并检查是否有失败
+        return !processor.has_failed();
     } catch (const std::exception &ex) {
-        std::cerr << "directory processing failed: " << ex.what() << std::endl;
+        logger.error("directory processing failed: %s\n", ex.what());
         return false;
     }
 }
@@ -417,13 +547,13 @@ int main(int argc, char *argv[])
     bool has_failed = false;
     try {
         g.init(argc, argv);
-        std::cerr << "convert start...\n";
+        logger.error("convert start...\n");
 
         g.input = fs::absolute(g.input);
         g.output = fs::absolute(g.output);
 
         if (!fs::exists(g.input)) {
-            std::cerr << "input file or directory does not exist: " << g.input << std::endl;
+            logger.error("input file or directory does not exist: %s\n", g.input.string().c_str());
             return 1;
         }
 
@@ -438,24 +568,24 @@ int main(int argc, char *argv[])
             // Check suffix if specified
             if (g.suffix) {
                 if (!should_include_suffix(g.input)) {
-                    std::cerr << "input file does not match any specified suffix\n";
+                    logger.error("input file does not match any specified suffix\n");
                     return 1;
                 }
             }
 
-            if(!process_file(g.input, g.output)) {
+            if (!process_file(g.input, g.output)) {
                 has_failed = true;
             }
         }
 
         if (has_failed) {
-            std::cerr << "convert failed\n";
+            logger.error("convert failed\n");
             return 1;
         }
-        std::cerr << "convert done.\n";
+        logger.error("convert done.\n");
         return 0;
     } catch (const std::exception &ex) {
-        std::cerr << "convert failed: " << ex.what() << std::endl;
+        logger.error("convert failed: %s\n", ex.what());
         return 1;
     }
 }
