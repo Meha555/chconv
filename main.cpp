@@ -339,8 +339,9 @@ static bool process_file(const fs::path &input_path, const fs::path &output_path
 
 static bool process_directory(const fs::path &input_dir, const fs::path &output_dir)
 {
+    bool has_failed = false;
+    bool has_processed_file = false;
     try {
-        bool has_processed_file = false;
 
         if (g.recursive) {
             for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
@@ -365,7 +366,7 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
                     const fs::path output_path = fs::path(output_dir) / relative_path;
 
                     if (!process_file(input_path, output_path)) {
-                        return false;
+                        has_failed = true;
                     }
                 }
             }
@@ -391,7 +392,7 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
                     const fs::path output_path = fs::path(output_dir) / filename;
 
                     if (!process_file(input_path, output_path)) {
-                        return false;
+                        has_failed = true;
                     }
                 }
             }
@@ -413,6 +414,7 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
 
 int main(int argc, char *argv[])
 {
+    bool has_failed = false;
     try {
         g.init(argc, argv);
         std::cerr << "convert start...\n";
@@ -428,8 +430,7 @@ int main(int argc, char *argv[])
         // Check if input is directory
         if (fs::is_directory(g.input)) {
             if (!process_directory(g.input, g.output)) {
-                std::cerr << "convert failed\n";
-                return 1;
+                has_failed = true;
             }
         }
         // Process single file
@@ -442,12 +443,15 @@ int main(int argc, char *argv[])
                 }
             }
 
-            if (!process_file(g.input, g.output)) {
-                std::cerr << "convert failed\n";
-                return 1;
+            if(!process_file(g.input, g.output)) {
+                has_failed = true;
             }
         }
 
+        if (has_failed) {
+            std::cerr << "convert failed\n";
+            return 1;
+        }
         std::cerr << "convert done.\n";
         return 0;
     } catch (const std::exception &ex) {
