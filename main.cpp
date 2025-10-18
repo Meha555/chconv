@@ -3,10 +3,12 @@
 #include <errno.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <optional>
 #include <regex>
 #include <sstream>
+#include <syncstream>
 
 #include "cmdline.h"
 #include <iconv.h>
@@ -16,15 +18,19 @@
 
 namespace fs = std::filesystem;
 
-struct guard_t
+struct uchardet_guard_t
 {
-    guard_t()
+    uchardet_guard_t()
+        : cd(uchardet_new())
     {
-        cd = uchardet_new();
     }
-    ~guard_t()
+    ~uchardet_guard_t()
     {
         uchardet_delete(cd);
+    }
+    operator uchardet_t() const
+    {
+        return cd;
     }
     uchardet_t cd;
 };
@@ -37,7 +43,7 @@ enum class processing_status {
 
 static const char *render_string(const char *fmt, ...)
 {
-    static char buf[64] = {0};
+    thread_local static char buf[64] = {0};
     va_list args;
     va_start(args, fmt);
     std::vsprintf(buf, fmt, args);
@@ -55,8 +61,6 @@ static struct options
     std::optional<std::string> suffix;
     std::optional<std::string> to;
     std::optional<std::string> exclude;
-
-    guard_t guard;
 
     void init(int argc, char *argv[])
     {
@@ -227,11 +231,11 @@ static std::string detect_encoding(const fs::path &filename)
     // NOTE uchardet_reset的调用会修改uchardet_get_charset返回的字符串地址，
     // 所以在使用uchardet_get_charset返回的临时地址时，不能调用uchardet_reset
     // 因此将uchardet_reset放到最前面调用
-    uchardet_reset(g.guard.cd);
-    uchardet_handle_data(g.guard.cd, buffer.data(), buffer.size());
-    uchardet_data_end(g.guard.cd);
+    uchardet_guard_t cd;
+    uchardet_handle_data(cd, buffer.data(), buffer.size());
+    uchardet_data_end(cd);
 
-    const char *encoding = uchardet_get_charset(g.guard.cd);
+    const char *encoding = uchardet_get_charset(cd);
     if (std::strcmp(encoding, "") == 0) {
         throw std::runtime_error("unrecognized encoding of file: " + filename.string());
     }
@@ -243,9 +247,11 @@ static bool convert_encoding(const fs::path &input_filename,
                              const fs::path &output_filename,
                              const std::string &to_encoding)
 {
+    std::osyncstream serr(std::cerr);
+
     std::ifstream input_file(input_filename, std::ios::binary);
     if (!input_file.is_open()) {
-        std::cerr << "cannot open file: " << input_filename << '\n';
+        serr << "cannot open file: " << input_filename << '\n';
         return false;
     }
 
@@ -255,13 +261,13 @@ static bool convert_encoding(const fs::path &input_filename,
     input_file.seekg(0, std::ios::beg);
     std::vector<char> input_buffer(size);
     if (!input_file.read(input_buffer.data(), size)) {
-        std::cerr << "failed to read: " << input_filename << '\n';
+        serr << "failed to read: " << input_filename << '\n';
         return false;
     }
 
     iconv_t cd = iconv_open(to_encoding.c_str(), from_encoding.c_str());
     if (cd == (iconv_t)-1) {
-        std::cerr << "cannot convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << "): " << std::strerror(errno) << "(" << errno << ")\n";
+        serr << "cannot convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << "): " << std::strerror(errno) << "(" << errno << ")\n";
         return false;
     }
 
@@ -276,7 +282,7 @@ static bool convert_encoding(const fs::path &input_filename,
 
     size_t result = iconv(cd, &in_ptr, &in_left, &out_ptr, &out_left);
     if (result == (size_t)-1) {
-        std::cerr << "convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << std::strerror(errno) << "(" << errno << ")\n";
+        serr << "convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << std::strerror(errno) << "(" << errno << ")\n";
         iconv_close(cd);
         return false;
     }
@@ -285,7 +291,7 @@ static bool convert_encoding(const fs::path &input_filename,
 
     std::ofstream output_file(output_filename, std::ios::binary);
     if (!output_file.is_open()) {
-        std::cerr << "cannot open file: " << output_filename << '\n';
+        serr << "cannot open file: " << output_filename << '\n';
         return false;
     }
 
@@ -295,6 +301,8 @@ static bool convert_encoding(const fs::path &input_filename,
 
 static processing_status process_file(const fs::path &input_path, const fs::path &output_path)
 {
+    std::osyncstream sout(std::cout);
+    std::osyncstream serr(std::cerr);
     try {
         // Check suffix if specified
         if (!should_include_suffix(g.input)) {
@@ -303,34 +311,31 @@ static processing_status process_file(const fs::path &input_path, const fs::path
 
         // detect file encoding
         const std::string file_encoding = detect_encoding(input_path);
-        if (g.verbose) {
-            std::cerr << input_path << "(" << file_encoding << ")\n";
-        }
 
         if (g.dry_run) {
-            std::cerr << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
+            sout << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
             return processing_status::success;
         }
 
         fs::create_directories(fs::path(output_path).parent_path());
 
-        if (convert_encoding(input_path, file_encoding, output_path, g.to.value())) {
-            if (g.verbose) {
-                std::cerr << "converted: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
-            }
-            return processing_status::success;
+        if (g.verbose) {
+            sout << "converting: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
         }
-        return processing_status::error;
+        return convert_encoding(input_path, file_encoding, output_path, g.to.value()) ? processing_status::success : processing_status::error;
     } catch (const std::exception &ex) {
-        std::cerr << "convert failed for " << input_path << ": " << ex.what() << '\n';
+        serr << "convert failed for " << input_path << ": " << ex.what() << '\n';
         return processing_status::error;
     }
 }
 
 static processing_status process_directory(const fs::path &input_dir, const fs::path &output_dir)
 {
+    std::osyncstream serr(std::cerr);
+
     bool has_failed = false;
     bool has_processed_file = false;
+    std::vector<std::future<processing_status>> futures;
     try {
         if (g.recursive) {
             for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
@@ -344,10 +349,7 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
                     const fs::path relative_path = fs::relative(entry.path(), input_dir);
 
                     has_processed_file = true;
-                    const fs::path output_path = fs::path(output_dir) / relative_path; // this is an absolute path
-                    if (process_file(entry.path(), output_path) == processing_status::error) {
-                        has_failed = true;
-                    }
+                    futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), fs::path(output_dir) / relative_path)); // this is an absolute path
                 }
             }
         } else {
@@ -362,24 +364,27 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
                     const fs::path relative_path = fs::relative(entry.path(), input_dir);
 
                     has_processed_file = true;
-                    const fs::path output_path = fs::path(output_dir) / filename;
-                    if (process_file(entry.path(), output_path) == processing_status::error) {
-                        has_failed = true;
-                    }
+                    futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), fs::path(output_dir) / filename));
                 }
             }
         }
 
         if (!has_processed_file) {
             if (g.suffix) {
-                std::cerr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << '\n';
+                serr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << '\n';
             } else {
-                std::cerr << "no file processed in: " << input_dir << '\n';
+                serr << "no file processed in: " << input_dir << '\n';
+            }
+        }
+
+        for (auto &future : futures) {
+            if (future.get() == processing_status::error) {
+                has_failed = true;
             }
         }
         return has_failed ? processing_status::error : processing_status::success;
     } catch (const std::exception &ex) {
-        std::cerr << "directory processing failed: " << ex.what() << '\n';
+        serr << "directory processing failed: " << ex.what() << '\n';
         return processing_status::error;
     }
 }
@@ -389,7 +394,7 @@ int main(int argc, char *argv[])
     bool has_failed = false;
     try {
         g.init(argc, argv);
-        std::cerr << "convert start...\n";
+        std::cout << "convert start...\n";
 
         g.input = fs::absolute(g.input);
         g.output = fs::absolute(g.output);
@@ -414,7 +419,7 @@ int main(int argc, char *argv[])
             std::cerr << "convert failed\n";
             return 1;
         }
-        std::cerr << "convert done.\n";
+        std::cout << "convert done.\n";
         return 0;
     } catch (const std::exception &ex) {
         std::cerr << "convert failed: " << ex.what() << '\n';
