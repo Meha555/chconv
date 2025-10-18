@@ -16,8 +16,6 @@
 
 namespace fs = std::filesystem;
 
-namespace
-{
 struct guard_t
 {
     guard_t()
@@ -30,7 +28,12 @@ struct guard_t
     }
     uchardet_t cd;
 };
-}
+
+enum class processing_status {
+    skip,
+    success,
+    error,
+};
 
 static const char *render_string(const char *fmt, ...)
 {
@@ -135,20 +138,14 @@ static bool should_exclude(const fs::path &path)
             std::regex regex_pattern(pattern);
 
             if (std::regex_search(path_str, regex_pattern) || // directory
-                std::regex_search(filename, regex_pattern) // filename
+                std::regex_search(filename, regex_pattern) || // filename
+                std::regex_search(extension, regex_pattern) // extension
             ) {
                 return true;
             }
 
-            if (!extension.empty()) {
-                if (std::regex_search(extension, regex_pattern) || // extension with dot
-                    std::regex_search(extension.substr(1), regex_pattern) // extension without dot
-                ) {
-                    return true;
-                }
-            }
-
-            // Check if pattern matches any directory component
+            // Check if pattern matches any directory component:
+            // e.g.: /home/tom/build/file.txt, --exclude=build, then it should be exclude
             for (const auto &part : path) {
                 if (std::regex_search(part.string(), regex_pattern)) {
                     return true;
@@ -158,7 +155,7 @@ static bool should_exclude(const fs::path &path)
             // If regex_pattern is invalid, fall back to simple string matching
             if (path_str.find(pattern) != std::string::npos || // is directory
                 filename.find(pattern) != std::string::npos || // is filename
-                (!extension.empty() && extension == pattern)) { // is file's suffix
+                extension == pattern) { // is file's suffix
                 return true;
             }
 
@@ -176,14 +173,14 @@ static bool should_exclude(const fs::path &path)
     return false;
 }
 
-static bool should_include_suffix(const fs::path &path)
+static bool should_include_suffix(const fs::path &filepath)
 {
     // if no suffix specified, include all files
     if (!g.suffix) {
         return true;
     }
 
-    const std::string extension = path.extension().string();
+    const std::string extension = filepath.extension().string();
 
     // if file has no extension but we specified --sufix, exclude it
     if (extension.empty()) {
@@ -198,32 +195,18 @@ static bool should_include_suffix(const fs::path &path)
             std::regex regex_pattern(pattern);
 
             // Check if the file extension matches the regex_pattern
-            if (std::regex_search(extension, regex_pattern) || // extension with dot
-                std::regex_search(extension.substr(1), regex_pattern) // extension without dot
-            ) {
+            if (std::regex_search(extension, regex_pattern)) {
                 return true;
             }
         } catch (const std::regex_error &ex) {
             // If the regex_pattern is invalid, revert to simple string matching.
-            if (extension == pattern || // full extension string with dot
-                extension.substr(1) == pattern // full extension string without dot
-            ) {
+            if (extension == pattern) {
                 return true;
             }
         }
     }
 
     return false;
-}
-
-static void log(const char *fmt, ...)
-{
-    if (g.verbose) {
-        va_list args;
-        va_start(args, fmt);
-        std::vfprintf(stderr, fmt, args);
-        va_end(args);
-    }
 }
 
 static std::string detect_encoding(const fs::path &filename)
@@ -262,7 +245,7 @@ static bool convert_encoding(const fs::path &input_filename,
 {
     std::ifstream input_file(input_filename, std::ios::binary);
     if (!input_file.is_open()) {
-        std::cerr << "cannot open file: " << input_filename << std::endl;
+        std::cerr << "cannot open file: " << input_filename << '\n';
         return false;
     }
 
@@ -272,13 +255,13 @@ static bool convert_encoding(const fs::path &input_filename,
     input_file.seekg(0, std::ios::beg);
     std::vector<char> input_buffer(size);
     if (!input_file.read(input_buffer.data(), size)) {
-        std::cerr << "failed to read: " << input_filename << std::endl;
+        std::cerr << "failed to read: " << input_filename << '\n';
         return false;
     }
 
     iconv_t cd = iconv_open(to_encoding.c_str(), from_encoding.c_str());
     if (cd == (iconv_t)-1) {
-        std::cerr << "cannot convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << "): " << std::strerror(errno) << "(" << errno << ")" << std::endl;
+        std::cerr << "cannot convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << "): " << std::strerror(errno) << "(" << errno << ")\n";
         return false;
     }
 
@@ -293,7 +276,7 @@ static bool convert_encoding(const fs::path &input_filename,
 
     size_t result = iconv(cd, &in_ptr, &in_left, &out_ptr, &out_left);
     if (result == (size_t)-1) {
-        std::cerr << "convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << std::strerror(errno) << "(" << errno << ")" << std::endl;
+        std::cerr << "convert " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << std::strerror(errno) << "(" << errno << ")\n";
         iconv_close(cd);
         return false;
     }
@@ -302,7 +285,7 @@ static bool convert_encoding(const fs::path &input_filename,
 
     std::ofstream output_file(output_filename, std::ios::binary);
     if (!output_file.is_open()) {
-        std::cerr << "cannot open file: " << output_filename << std::endl;
+        std::cerr << "cannot open file: " << output_filename << '\n';
         return false;
     }
 
@@ -310,62 +293,59 @@ static bool convert_encoding(const fs::path &input_filename,
     return true;
 }
 
-static bool process_file(const fs::path &input_path, const fs::path &output_path)
+static processing_status process_file(const fs::path &input_path, const fs::path &output_path)
 {
     try {
+        // Check suffix if specified
+        if (!should_include_suffix(g.input)) {
+            return processing_status::skip;
+        }
+
         // detect file encoding
         const std::string file_encoding = detect_encoding(input_path);
-        log("%s: %s\n", input_path.string().c_str(), file_encoding.c_str());
+        if (g.verbose) {
+            std::cerr << input_path << "(" << file_encoding << ")\n";
+        }
 
         if (g.dry_run) {
-            std::cerr << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")" << std::endl;
-            return true;
+            std::cerr << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
+            return processing_status::success;
         }
 
         fs::create_directories(fs::path(output_path).parent_path());
 
         if (convert_encoding(input_path, file_encoding, output_path, g.to.value())) {
             if (g.verbose) {
-                std::cerr << "converted: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")" << std::endl;
+                std::cerr << "converted: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
             }
-            return true;
+            return processing_status::success;
         }
-        return false;
+        return processing_status::error;
     } catch (const std::exception &ex) {
-        std::cerr << "convert failed for " << input_path << ": " << ex.what() << std::endl;
-        return false;
+        std::cerr << "convert failed for " << input_path << ": " << ex.what() << '\n';
+        return processing_status::error;
     }
 }
 
-static bool process_directory(const fs::path &input_dir, const fs::path &output_dir)
+static processing_status process_directory(const fs::path &input_dir, const fs::path &output_dir)
 {
     bool has_failed = false;
     bool has_processed_file = false;
     try {
-
         if (g.recursive) {
             for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
                 // Check if the entry should be excluded
                 if (should_exclude(entry.path())) {
                     continue;
                 }
-
+                // we treat regular file as processing unit
                 if (entry.is_regular_file()) {
-                    const fs::path input_path = entry.path();
                     // use relative path to keep the directory structure
                     const fs::path relative_path = fs::relative(entry.path(), input_dir);
 
-                    // Check suffix if specified
-                    if (g.suffix) {
-                        if (!should_include_suffix(input_path)) {
-                            continue;
-                        }
-                    }
-
                     has_processed_file = true;
-                    const fs::path output_path = fs::path(output_dir) / relative_path;
-
-                    if (!process_file(input_path, output_path)) {
+                    const fs::path output_path = fs::path(output_dir) / relative_path; // this is an absolute path
+                    if (process_file(entry.path(), output_path) == processing_status::error) {
                         has_failed = true;
                     }
                 }
@@ -376,22 +356,14 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
                 if (should_exclude(entry.path())) {
                     continue;
                 }
-
+                // we treat regular file as processing unit
                 if (entry.is_regular_file()) {
-                    const fs::path input_path = entry.path();
                     const fs::path filename = entry.path().filename();
-
-                    // Check suffix if specified
-                    if (g.suffix) {
-                        if (!should_include_suffix(input_path)) {
-                            continue;
-                        }
-                    }
+                    const fs::path relative_path = fs::relative(entry.path(), input_dir);
 
                     has_processed_file = true;
                     const fs::path output_path = fs::path(output_dir) / filename;
-
-                    if (!process_file(input_path, output_path)) {
+                    if (process_file(entry.path(), output_path) == processing_status::error) {
                         has_failed = true;
                     }
                 }
@@ -400,15 +372,15 @@ static bool process_directory(const fs::path &input_dir, const fs::path &output_
 
         if (!has_processed_file) {
             if (g.suffix) {
-                std::cerr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << std::endl;
+                std::cerr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << '\n';
             } else {
-                std::cerr << "no file processed in: " << input_dir << std::endl;
+                std::cerr << "no file processed in: " << input_dir << '\n';
             }
         }
-        return true;
+        return has_failed ? processing_status::error : processing_status::success;
     } catch (const std::exception &ex) {
-        std::cerr << "directory processing failed: " << ex.what() << std::endl;
-        return false;
+        std::cerr << "directory processing failed: " << ex.what() << '\n';
+        return processing_status::error;
     }
 }
 
@@ -423,27 +395,17 @@ int main(int argc, char *argv[])
         g.output = fs::absolute(g.output);
 
         if (!fs::exists(g.input)) {
-            std::cerr << "input file or directory does not exist: " << g.input << std::endl;
+            std::cerr << "input file or directory does not exist: " << g.input << '\n';
             return 1;
         }
 
         // Check if input is directory
         if (fs::is_directory(g.input)) {
-            if (!process_directory(g.input, g.output)) {
+            if (process_directory(g.input, g.output) == processing_status::error) {
                 has_failed = true;
             }
-        }
-        // Process single file
-        else {
-            // Check suffix if specified
-            if (g.suffix) {
-                if (!should_include_suffix(g.input)) {
-                    std::cerr << "input file does not match any specified suffix\n";
-                    return 1;
-                }
-            }
-
-            if(!process_file(g.input, g.output)) {
+        } else {
+            if (process_file(g.input, g.output) == processing_status::error) {
                 has_failed = true;
             }
         }
@@ -455,7 +417,7 @@ int main(int argc, char *argv[])
         std::cerr << "convert done.\n";
         return 0;
     } catch (const std::exception &ex) {
-        std::cerr << "convert failed: " << ex.what() << std::endl;
+        std::cerr << "convert failed: " << ex.what() << '\n';
         return 1;
     }
 }
