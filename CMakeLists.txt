@@ -32,11 +32,9 @@ configure_file(
     @ONLY
 )
 
-find_package(Threads REQUIRED)
-
 add_executable(chconv main.cpp)
 target_include_directories(chconv PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(chconv PRIVATE ${CHARDET_LIB} ${ICONV_LIB} cmdline Threads::Threads)
+target_link_libraries(chconv PRIVATE ${CHARDET_LIB} ${ICONV_LIB} cmdline)
 
 add_custom_command(
     TARGET chconv POST_BUILD
