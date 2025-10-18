@@ -18,7 +18,7 @@ chconv is a command-line tool for automatically detecting file character encodin
 
 ## Build Requirements
 
-- C++17 or higher
+- C++20
 - Dependencies:
   - [uchardet](https://www.freedesktop.org/wiki/Software/uchardet/) - for character encoding detection
   - [libiconv](https://www.gnu.org/software/libiconv/) - for character encoding conversion
@@ -42,7 +42,7 @@ chconv [options] -i <input file/directory> -o <output file/directory>
 | --recursive | -r | Recursively process directories |
 | --dry-run | -d | Show operations to be performed without actually converting |
 | --suffix | -s | Specify file suffix to process (supports regular expressions, multiple patterns separated by ';') |
-| --exclude | | Exclude files, suffixes or directories from processing using regular expressions (separated by ';') |
+| --exclude | -e | Exclude files, suffixes or directories from processing using regular expressions (separated by ';') |
 
 ### Examples
 

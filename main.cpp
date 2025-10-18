@@ -94,6 +94,7 @@ static struct options
 
     void init(int argc, char *argv[])
     {
+        cmdline::g_config.show_option_typename = false;
         // clang-format off
         parser.program_name("chconv");
         parser.introduction("file encoding converter");

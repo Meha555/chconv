@@ -16,7 +16,7 @@ chconv 是一个命令行工具，用于自动检测文件的字符编码并将�
 
 ## 编译要求
 
-- C++17 或更高版本
+- C++20
 - 依赖库：
   - [uchardet](https://www.freedesktop.org/wiki/Software/uchardet/) - 用于字符编码检测
   - [libiconv](https://www.gnu.org/software/libiconv/) - 用于字符编码转换
@@ -40,7 +40,7 @@ chconv [选项] -i <输入文件/目录> -o <输出文件/目录>
 | --recursive | -r | 递归处理目录 |
 | --dry-run | -d | 仅显示将要执行的操作，不实际转换 |
 | --suffix | -s | 指定要处理的文件后缀（支持正则表达式，多个模式用';'分隔） |
-| --exclude | | 使用正则表达式排除要处理的文件、后缀或目录（用';'分隔） |
+| --exclude | -e | 使用正则表达式排除要处理的文件、后缀或目录（用';'分隔） |
 
 ### 示例
 
