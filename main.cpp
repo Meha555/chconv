@@ -13,7 +13,6 @@
 #include "cmdline.h"
 #include <iconv.h>
 #include <uchardet.h>
-
 #include "version.h"
 
 namespace fs = std::filesystem;
@@ -51,6 +50,37 @@ static const char *render_string(const char *fmt, ...)
     return buf;
 }
 
+static std::vector<std::string> split_string(const std::string &str, char delimiter)
+{
+    std::vector<std::string> tokens;
+    std::stringstream ss(str);
+    std::string token;
+
+    while (std::getline(ss, token, delimiter)) {
+        if (!token.empty()) {
+            tokens.push_back(token);
+        }
+    }
+
+    return tokens;
+}
+
+using regex_pairs = std::pair<std::string, std::vector<std::regex>>;
+static bool parse_regex_pairs(const std::string &pattern, std::optional<regex_pairs> &pairs)
+{
+    const auto pattern_strings = split_string(pattern, ';');
+    pairs = std::make_pair(pattern, std::vector<std::regex>());
+    try {
+        for (const auto &pattern_str : pattern_strings) {
+            pairs->second.emplace_back(pattern_str);
+        }
+    } catch (const std::regex_error &ex) {
+        std::cerr << ex.what() << '\n';
+        return false;
+    }
+    return true;
+}
+
 static struct options
 {
     bool verbose = false;
@@ -58,9 +88,9 @@ static struct options
     bool recursive = false;
     fs::path input;
     fs::path output;
-    std::optional<std::string> suffix;
+    std::optional<regex_pairs> suffix;
     std::optional<std::string> to;
-    std::optional<std::string> exclude;
+    std::optional<regex_pairs> exclude;
 
     void init(int argc, char *argv[])
     {
@@ -95,10 +125,14 @@ static struct options
         output = parser.get<std::string>("output");
         // optional options
         if (parser.exist("suffix")) {
-            suffix = parser.get<std::string>("suffix");
+            if (!parse_regex_pairs(parser.get<std::string>("suffix"), suffix)) {
+                std::exit(1);
+            }
         }
         if (parser.exist("exclude")) {
-            exclude = parser.get<std::string>("exclude");
+            if (!parse_regex_pairs(parser.get<std::string>("exclude"), exclude)) {
+                std::exit(1);
+            }
         }
         // options with default value
         to = parser.get<std::string>("to");
@@ -107,21 +141,6 @@ static struct options
 private:
     cmdline::parser parser;
 } g;
-
-static std::vector<std::string> split_string(const std::string &str, char delimiter)
-{
-    std::vector<std::string> tokens;
-    std::stringstream ss(str);
-    std::string token;
-
-    while (std::getline(ss, token, delimiter)) {
-        if (!token.empty()) {
-            tokens.push_back(token);
-        }
-    }
-
-    return tokens;
-}
 
 static bool should_exclude(const fs::path &path)
 {
@@ -133,45 +152,56 @@ static bool should_exclude(const fs::path &path)
     const std::string path_str = path.string();
     const std::string filename = path.filename().string();
     const std::string extension = path.extension().string();
+    try {
+        const fs::path relative_path = fs::relative(path, g.input);
 
-    // Split exclude patterns by ';'
-    const std::vector<std::string> patterns = split_string(g.exclude.value(), ';');
-
-    for (const auto &pattern : patterns) {
-        try {
-            std::regex regex_pattern(pattern);
-
-            if (std::regex_search(path_str, regex_pattern) || // directory
-                std::regex_search(filename, regex_pattern) || // filename
-                std::regex_search(extension, regex_pattern) // extension
-            ) {
-                return true;
-            }
-
-            // Check if pattern matches any directory component:
-            // e.g.: /home/tom/build/file.txt, --exclude=build, then it should be exclude
-            for (const auto &part : path) {
-                if (std::regex_search(part.string(), regex_pattern)) {
+        const auto &regex_patterns = g.exclude->second;
+        for (const auto &regex_pattern : regex_patterns) {
+            try {
+                if (std::regex_match(path_str, regex_pattern) || // directory
+                    std::regex_match(filename, regex_pattern) || // filename
+                    std::regex_match(extension, regex_pattern) // extension
+                ) {
                     return true;
                 }
-            }
-        } catch (const std::regex_error &ex) {
-            // If regex_pattern is invalid, fall back to simple string matching
-            if (path_str.find(pattern) != std::string::npos || // is directory
-                filename.find(pattern) != std::string::npos || // is filename
-                extension == pattern) { // is file's suffix
-                return true;
-            }
 
-            // Check if pattern is a directory name and matches a parent directory
-            if (fs::is_directory(path)) {
-                for (const auto &part : path) {
-                    if (part.string() == pattern) {
+                // Check if pattern matches any directory component:
+                // e.g.: cwd is /home/tom/chconv
+                // /home/tom/chconv/ build/chconv/file.txt, --exclude=chconv, then it should be exclude
+                // /home/tom/chconv/ build/file.txt, --exclude=chconv, then it shouldn't be exclude
+                for (const auto &part : relative_path) {
+                    if (std::regex_match(part.string(), regex_pattern)) {
                         return true;
+                    }
+                }
+            } catch (const std::regex_error &ex) {
+                // If regex_pattern is invalid, fall back to simple string matching
+                if (path_str.find(g.exclude->first) != std::string::npos || // is directory
+                    filename.find(g.exclude->first) != std::string::npos || // is filename
+                    extension == g.exclude->first) { // is file's suffix
+                    return true;
+                }
+
+                // Check if pattern is a directory name and matches a parent directory
+                if (fs::is_directory(path)) {
+                    try {
+                        for (const auto &part : relative_path) {
+                            if (part.string() == g.exclude->first) {
+                                return true;
+                            }
+                        }
+                    } catch (const fs::filesystem_error &) {
+                        // If we can't compute relative path, fall back to simple string matching
+                        if (path_str.find(g.exclude->first) != std::string::npos) {
+                            return true;
+                        }
                     }
                 }
             }
         }
+    } catch (const fs::filesystem_error &ex) {
+        // If we can't compute relative path, fall back to simple string matching
+        return path_str.find(g.exclude->first) != std::string::npos;
     }
 
     return false;
@@ -190,21 +220,16 @@ static bool should_include_suffix(const fs::path &filepath)
     if (extension.empty()) {
         return false;
     }
-
-    // Split suffix patterns by ';'
-    const std::vector<std::string> patterns = split_string(g.suffix.value(), ';');
-
-    for (const auto &pattern : patterns) {
+    const auto &regex_patterns = g.suffix->second;
+    for (const auto &regex_pattern : regex_patterns) {
         try {
-            std::regex regex_pattern(pattern);
-
             // Check if the file extension matches the regex_pattern
-            if (std::regex_search(extension, regex_pattern)) {
+            if (std::regex_match(extension, regex_pattern)) {
                 return true;
             }
         } catch (const std::regex_error &ex) {
             // If the regex_pattern is invalid, revert to simple string matching.
-            if (extension == pattern) {
+            if (extension == g.suffix->first) {
                 return true;
             }
         }
@@ -221,6 +246,9 @@ static std::string detect_encoding(const fs::path &filename)
     }
 
     const std::streamsize size = file.tellg();
+    if (size <= 0) {
+        return "empty file";
+    }
     file.seekg(0, std::ios::beg);
 
     std::vector<char> buffer(size);
@@ -311,6 +339,12 @@ static processing_status process_file(const fs::path &input_path, const fs::path
 
         // detect file encoding
         const std::string file_encoding = detect_encoding(input_path);
+        if (file_encoding == "empty file") {
+            if (g.dry_run || g.verbose) {
+                sout << "skip empty file: " << input_path << '\n';
+            }
+            return processing_status::skip;
+        }
 
         if (g.dry_run) {
             sout << "would convert: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
@@ -337,41 +371,36 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
     bool has_processed_file = false;
     std::vector<std::future<processing_status>> futures;
     try {
-        if (g.recursive) {
-            for (const auto &entry : fs::recursive_directory_iterator(input_dir)) {
+        std::vector<fs::path> input_dirs{input_dir};
+        // Manually iterate instead of using fs::recursive_directory_iterator, besause we want to using minimum-suffix matching for entries, like VSCode.
+        // Use index-based loop to avoid iterator invalidation when adding elements to vector
+        for (size_t i = 0; i < input_dirs.size(); ++i) {
+            for (const auto &entry : fs::directory_iterator(input_dirs[i])) {
                 // Check if the entry should be excluded
-                if (should_exclude(entry.path())) {
-                    continue;
+                if (entry.is_directory()) {
+                    if (should_exclude(entry.path())) {
+                        continue;
+                    } else {
+                        input_dirs.push_back(entry.path());
+                    }
                 }
                 // we treat regular file as processing unit
-                if (entry.is_regular_file()) {
-                    // use relative path to keep the directory structure
-                    const fs::path relative_path = fs::relative(entry.path(), input_dir);
-
-                    has_processed_file = true;
-                    futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), fs::path(output_dir) / relative_path)); // this is an absolute path
-                }
-            }
-        } else {
-            for (const auto &entry : fs::directory_iterator(input_dir)) {
-                // Check if the entry should be excluded
-                if (should_exclude(entry.path())) {
-                    continue;
-                }
-                // we treat regular file as processing unit
-                if (entry.is_regular_file()) {
+                if (entry.is_regular_file() && !should_exclude(entry.path())) {
                     const fs::path filename = entry.path().filename();
-                    const fs::path relative_path = fs::relative(entry.path(), input_dir);
+                    const fs::path relative_path = fs::relative(entry.path(), input_dirs[i]);
 
                     has_processed_file = true;
-                    futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), fs::path(output_dir) / filename));
+                    // keep the relative directory structure
+                    const fs::path rel_dir = fs::relative(input_dirs[i], g.input);
+                    const fs::path target_path = output_dir / rel_dir / relative_path;
+                    futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), target_path));
                 }
             }
         }
 
         if (!has_processed_file) {
             if (g.suffix) {
-                serr << "no file processed with suffix: \"" << g.suffix.value() << "\" in: " << input_dir << '\n';
+                serr << "no file processed with suffix: \"" << g.suffix->first << "\" in: " << input_dir << '\n';
             } else {
                 serr << "no file processed in: " << input_dir << '\n';
             }
