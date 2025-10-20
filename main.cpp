@@ -10,29 +10,88 @@
 #include <sstream>
 #include <syncstream>
 
-#include "cmdline.h"
 #include <iconv.h>
+#include <magic.h>
 #include <uchardet.h>
+#include "cmdline.h"
+#include "incbin.h"
 #include "version.h"
 
 namespace fs = std::filesystem;
 
-struct uchardet_guard_t
+INCBIN(magic_database_buffer, "../misc/magic.mgc"); // MAGIC_MGC_FILE
+
+static std::atomic_uint64_t g_processed_files = 0;
+
+template<typename Type, typename Ctor, typename Dtor>
+struct resource_guard_t
 {
-    uchardet_guard_t()
-        : cd(uchardet_new())
+    template<typename... Args>
+    resource_guard_t(Args&&... args)
+        : resource(Ctor{}(std::forward<Args>(args)...))
     {
+        static_assert(std::is_invocable_v<Ctor, Args...>);
     }
-    ~uchardet_guard_t()
+    ~resource_guard_t()
+    {
+        static_assert(std::is_invocable_v<Dtor, Type>);
+        (Dtor{})(resource);
+    }
+    operator Type() const
+    {
+        return resource;
+    }
+    Type resource;
+};
+
+namespace
+{
+struct uchardet_ctor_t
+{
+    uchardet_t operator()() const
+    {
+        return uchardet_new();
+    }
+};
+struct uchardet_dtor_t
+{
+    void operator()(uchardet_t cd) const
     {
         uchardet_delete(cd);
     }
-    operator uchardet_t() const
-    {
-        return cd;
-    }
-    uchardet_t cd;
 };
+
+struct magic_ctor_t
+{
+    magic_t operator()(int flags) const
+    {
+        magic_t cookie = magic_open(flags);
+        if (cookie == nullptr) {
+            throw std::runtime_error("failed to open magic cookie");
+        }
+        #if EMBED_MAGIC_MGC_FILE
+        static const char *magic_buffers[1] = { (char*)&gmagic_database_bufferData, };
+        static size_t sizes[1] = {gmagic_database_bufferSize,};
+        if (magic_load_buffers(cookie, (void**)&magic_buffers, sizes, 1) != 0) {
+        #else
+        if (magic_load(cookie, MAGIC_MGC_FILE) != 0) {
+        #endif
+            throw std::runtime_error("failed to load magic database: " + std::string(magic_error(cookie)));
+        }
+        return cookie;
+    }
+};
+struct magic_dtor_t
+{
+    void operator()(magic_t cookie) const
+    {
+        magic_close(cookie);
+    }
+};
+}
+
+using uchardet_guard_t = resource_guard_t<uchardet_t, uchardet_ctor_t, uchardet_dtor_t>;
+using magic_guard_t = resource_guard_t<magic_t, magic_ctor_t, magic_dtor_t>;
 
 enum class processing_status {
     skip,
@@ -110,10 +169,11 @@ static struct options
                 "encoding of output file",
                 R"(see https://www.gnu.org/savannah-checkouts/gnu/libiconv/ for more information)"),
             false, "UTF-8");
-        parser.version(render_string("%s (libuchardet@%s, libiconv@%s)",
+        parser.version(render_string("%s (libuchardet@%s, libiconv@%s, libmagic@%s)",
                                      CHCONV_VERSION,
                                      LIBCHARDET_VERSION,
-                                     LIBICONV_VERSION));
+                                     LIBICONV_VERSION,
+                                     LIBMAGIC_VERSION));
         // clang-format on
         parser.parse_check(argc, argv);
 
@@ -239,6 +299,16 @@ static bool should_include_suffix(const fs::path &filepath)
     return false;
 }
 
+static bool is_text_file(const fs::path &filepath)
+{
+    thread_local static magic_guard_t magic(MAGIC_MIME_TYPE);
+    const char *mime_type = magic_file(magic, filepath.string().c_str());
+    if (mime_type == nullptr) {
+        throw std::runtime_error("failed to detect mime type: " + std::string(magic_error(magic)));
+    }
+    return std::string(mime_type).find("text") != std::string::npos;
+}
+
 static std::string detect_encoding(const fs::path &filename)
 {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
@@ -337,7 +407,10 @@ static processing_status process_file(const fs::path &input_path, const fs::path
         if (!should_include_suffix(g.input)) {
             return processing_status::skip;
         }
-
+        // skip non-text file
+        if (!is_text_file(input_path)) {
+            return processing_status::skip;
+        }
         // detect file encoding
         const std::string file_encoding = detect_encoding(input_path);
         if (file_encoding == "empty file") {
@@ -357,7 +430,12 @@ static processing_status process_file(const fs::path &input_path, const fs::path
         if (g.verbose) {
             sout << "converting: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
         }
-        return convert_encoding(input_path, file_encoding, output_path, g.to.value()) ? processing_status::success : processing_status::error;
+        // convert file encoding
+        if (!convert_encoding(input_path, file_encoding, output_path, g.to.value())) {
+            return processing_status::error;
+        }
+        ++g_processed_files;
+        return processing_status::success;
     } catch (const std::exception &ex) {
         serr << "convert failed for " << input_path << ": " << ex.what() << '\n';
         return processing_status::error;
@@ -369,7 +447,7 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
     std::osyncstream serr(std::cerr);
 
     bool has_failed = false;
-    bool has_processed_file = false;
+    // bool has_processed_file = false;
     std::vector<std::future<processing_status>> futures;
     try {
         std::vector<fs::path> input_dirs{input_dir};
@@ -390,22 +468,23 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
                     const fs::path filename = entry.path().filename();
                     const fs::path relative_path = fs::relative(entry.path(), input_dirs[i]);
 
-                    has_processed_file = true;
+                    // has_processed_file = true;
                     // keep the relative directory structure
                     const fs::path rel_dir = fs::relative(input_dirs[i], g.input);
                     const fs::path target_path = output_dir / rel_dir / relative_path;
+                    // TODO 这里还是要改成线程池，不能简单起个线程就完事了，不然没法复用magic_t和uchardet_t句柄
                     futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), target_path));
                 }
             }
         }
 
-        if (!has_processed_file) {
-            if (g.suffix) {
-                serr << "no file processed with suffix: \"" << g.suffix->first << "\" in: " << input_dir << '\n';
-            } else {
-                serr << "no file processed in: " << input_dir << '\n';
-            }
-        }
+        // if (!has_processed_file) {
+        //     if (g.suffix) {
+        //         serr << "no file processed with suffix: \"" << g.suffix->first << "\" in: " << input_dir << '\n';
+        //     } else {
+        //         serr << "no file processed in: " << input_dir << '\n';
+        //     }
+        // }
 
         for (auto &future : futures) {
             if (future.get() == processing_status::error) {
@@ -449,7 +528,7 @@ int main(int argc, char *argv[])
             std::cerr << "convert failed\n";
             return 1;
         }
-        std::cout << "convert done.\n";
+        std::cout << "convert done. processed " << g_processed_files << " files.\n";
         return 0;
     } catch (const std::exception &ex) {
         std::cerr << "convert failed: " << ex.what() << '\n';

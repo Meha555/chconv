@@ -1,9 +1,11 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.21)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(chconv VERSION 1.2.0)
+project(chconv VERSION 1.3.0)
+
+option(EMBED_MAGIC_MGC_FILE "Embed magic.mgc file database" ON)
 
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/out)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/out)
@@ -23,6 +25,8 @@ include(FetchContent)
 include(cmake/FindLibchardet.cmake) # Using uchardet
 include(cmake/FindLibiconv.cmake)
 include(cmake/FindCmdline.cmake)
+include(cmake/FindLibmagic.cmake)
+include(cmake/FindIncbin.cmake)
 
 # 配置version.h文件
 configure_file(
@@ -31,9 +35,48 @@ configure_file(
     @ONLY
 )
 
-add_executable(chconv main.cpp)
-target_include_directories(chconv PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(chconv PRIVATE ${CHARDET_LIB} ${ICONV_LIB} cmdline)
+set(chconv_srcs ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+add_executable(chconv ${chconv_srcs})
+target_include_directories(chconv PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${INCBIN_INCLUDE_DIRS})
+target_link_libraries(chconv PRIVATE ${CHARDET_LIB} ${ICONV_LIB} cmdline ${MAGIC_LIB})
+target_compile_definitions(chconv PRIVATE MAGIC_MGC_FILE="${MAGIC_MGC_FILE}")
+if(EMBED_MAGIC_MGC_FILE)
+    target_compile_definitions(chconv PRIVATE EMBED_MAGIC_MGC_FILE)
+    # 使用生成文件的add_custom_command形式，这种形式在所有CMake版本中都支持DEPENDS
+    add_custom_command(
+        # TARGET chconv PRE_BUILD
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/data.c
+        COMMAND $<TARGET_FILE:incbin> ${chconv_srcs} -o ${CMAKE_CURRENT_BINARY_DIR}/data.c
+        COMMENT "Embedding magic.mgc file database"
+        DEPENDS incbin ${MAGIC_MGC_FILE}
+    )
+    # 标记data.c为生成文件，避免CMake在配置阶段检查文件是否存在
+    # set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/data.c PROPERTIES GENERATED TRUE)
+    # add_custom_target(incbin_data
+    #     COMMAND $<TARGET_FILE:incbin> ${chconv_srcs} -o ${CMAKE_CURRENT_BINARY_DIR}/data.c
+    #     COMMENT "Embedding magic.mgc file database"
+    #     DEPENDS incbin
+    # )
+    # add_dependencies(chconv incbin_data)
+    target_sources(chconv PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/data.c)
+endif()
+# if(EMBED_MAGIC_MGC_FILE)
+#     file(READ ${MAGIC_MGC_FILE} MAGIC_DATA HEX)
+
+#     # 将十六进制字符串转换为逗号分隔的十进制值
+#     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MAGIC_HEX_LIST ${MAGIC_DATA})
+#     string(REGEX REPLACE ",$" "" MAGIC_HEX_LIST ${MAGIC_HEX_LIST})
+
+#     # 计算数据长度
+#     string(LENGTH "${MAGIC_DATA}" HEX_LENGTH)
+#     math(EXPR DATA_LENGTH "${HEX_LENGTH} / 2")
+
+#     # 生成头文件内容
+#     set(MAGIC_HEADER_CONTENT "static const unsigned char g_magic_database_buffer[${DATA_LENGTH}] = {${MAGIC_HEX_LIST}};")
+
+#     # 写入头文件
+#     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/magic_static.h "#pragma once\n${MAGIC_HEADER_CONTENT}\n")
+# endif()
 
 add_custom_command(
     TARGET chconv POST_BUILD
