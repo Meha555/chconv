@@ -3,19 +3,20 @@
 #include <errno.h>
 #include <filesystem>
 #include <fstream>
-#include <future>
 #include <iostream>
+#include <execution>
+#include <numeric>
 #include <optional>
 #include <regex>
 #include <sstream>
 #include <syncstream>
 
-#include <iconv.h>
-#include <magic.h>
-#include <uchardet.h>
 #include "cmdline.h"
 #include "incbin.h"
 #include "version.h"
+#include <iconv.h>
+#include <magic.h>
+#include <uchardet.h>
 
 namespace fs = std::filesystem;
 
@@ -27,7 +28,7 @@ template<typename Type, typename Ctor, typename Dtor>
 struct resource_guard_t
 {
     template<typename... Args>
-    resource_guard_t(Args&&... args)
+    resource_guard_t(Args &&...args)
         : resource(Ctor{}(std::forward<Args>(args)...))
     {
         static_assert(std::is_invocable_v<Ctor, Args...>);
@@ -69,13 +70,17 @@ struct magic_ctor_t
         if (cookie == nullptr) {
             throw std::runtime_error("failed to open magic cookie");
         }
-        #if EMBED_MAGIC_MGC_FILE
-        static const char *magic_buffers[1] = { (char*)&gmagic_database_bufferData, };
-        static size_t sizes[1] = {gmagic_database_bufferSize,};
-        if (magic_load_buffers(cookie, (void**)&magic_buffers, sizes, 1) != 0) {
-        #else
+#if EMBED_MAGIC_MGC_FILE
+        static const char *magic_buffers[1] = {
+            (char *)&gmagic_database_bufferData,
+        };
+        static size_t sizes[1] = {
+            gmagic_database_bufferSize,
+        };
+        if (magic_load_buffers(cookie, (void **)&magic_buffers, sizes, 1) != 0) {
+#else
         if (magic_load(cookie, MAGIC_MGC_FILE) != 0) {
-        #endif
+#endif
             throw std::runtime_error("failed to load magic database: " + std::string(magic_error(cookie)));
         }
         return cookie;
@@ -98,6 +103,83 @@ enum class processing_status {
     success,
     error,
 };
+
+// class processor_pool_t
+// {
+//     using task_t = std::function<processing_status()>;
+
+// public:
+//     processor_pool_t(size_t size = std::thread::hardware_concurrency())
+//     {
+//         for (size_t i = 0; i < size; ++i) {
+//             workers_.emplace_back(&processor_pool_t::run, this);
+//         }
+//     }
+
+//     ~processor_pool_t()
+//     {
+//         stop();
+//     }
+
+//     template<typename Func, typename... Args>
+//     void post(Func &&func, Args &&...args)
+//     {
+//         static_assert(std::is_same_v<std::invoke_result_t<Func, Args...>, processing_status>);
+//         {
+//             std::lock_guard lck(mtx_);
+//             tasks_.emplace(std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+//         }
+//         cv_.notify_one();
+//     }
+
+//     void stop()
+//     {
+//         if (!stop_) {
+//             stop_ = true;
+//             cv_.notify_all();
+//             for (auto &worker : workers_) {
+//                 if (worker.joinable()) {
+//                     worker.join();
+//                 }
+//             }
+//         }
+//     }
+
+//     bool has_error()
+//     {
+//         stop();
+//         return has_error_.load();
+//     }
+
+// private:
+//     void run()
+//     {
+//         while (true) {
+//             task_t task;
+//             {
+//                 std::unique_lock lck(mtx_);
+//                 cv_.wait(lck, [this] {
+//                     return this->stop_ || !this->tasks_.empty();
+//                 });
+//                 if (stop_ && tasks_.empty()) {
+//                     break;
+//                 }
+//                 task = std::move(tasks_.front());
+//                 tasks_.pop();
+//             }
+//             if (task() == processing_status::error) {
+//                 has_error_ = true;
+//             }
+//         }
+//     }
+
+//     std::vector<std::thread> workers_;
+//     std::queue<task_t> tasks_;
+//     std::mutex mtx_;
+//     std::condition_variable cv_;
+//     std::atomic_bool stop_ = false;
+//     std::atomic_bool has_error_ = false;
+// };
 
 static const char *render_string(const char *fmt, ...)
 {
@@ -330,7 +412,8 @@ static std::string detect_encoding(const fs::path &filename)
     // NOTE uchardet_reset的调用会修改uchardet_get_charset返回的字符串地址，
     // 所以在使用uchardet_get_charset返回的临时地址时，不能调用uchardet_reset
     // 因此将uchardet_reset放到最前面调用
-    uchardet_guard_t cd;
+    thread_local static uchardet_guard_t cd;
+    uchardet_reset(cd);
     uchardet_handle_data(cd, buffer.data(), buffer.size());
     uchardet_data_end(cd);
 
@@ -347,6 +430,18 @@ static bool convert_encoding(const fs::path &input_filename,
                              const std::string &to_encoding)
 {
     std::osyncstream serr(std::cerr);
+
+    // 如果源编码和目标编码相同，则直接复制文件
+    if (from_encoding == to_encoding) {
+        try {
+            if (input_filename != output_filename)
+                fs::copy_file(input_filename, output_filename, fs::copy_options::overwrite_existing);
+            return true;
+        } catch (const fs::filesystem_error& ex) {
+            serr << "copy " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << ex.what() << '\n';
+            return false;
+        }
+    }
 
     std::ifstream input_file(input_filename, std::ios::binary);
     if (!input_file.is_open()) {
@@ -448,7 +543,8 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
 
     bool has_failed = false;
     // bool has_processed_file = false;
-    std::vector<std::future<processing_status>> futures;
+    // std::vector<std::future<processing_status>> futures;
+    std::vector<std::pair<fs::path, fs::path>> tasks;
     try {
         std::vector<fs::path> input_dirs{input_dir};
         // Manually iterate instead of using fs::recursive_directory_iterator, besause we want to using minimum-suffix matching for entries, like VSCode.
@@ -472,8 +568,9 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
                     // keep the relative directory structure
                     const fs::path rel_dir = fs::relative(input_dirs[i], g.input);
                     const fs::path target_path = output_dir / rel_dir / relative_path;
-                    // TODO 这里还是要改成线程池，不能简单起个线程就完事了，不然没法复用magic_t和uchardet_t句柄
-                    futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), target_path));
+                    // 这里还是要改成线程池，不能简单起个线程就完事了，不然没法复用magic_t和uchardet_t句柄
+                    // futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), target_path));
+                    tasks.emplace_back(entry.path(), target_path);
                 }
             }
         }
@@ -486,9 +583,34 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
         //     }
         // }
 
-        for (auto &future : futures) {
-            if (future.get() == processing_status::error) {
-                has_failed = true;
+        // for (auto &future : futures) {
+        //     if (future.get() == processing_status::error) {
+        //         has_failed = true;
+        //     }
+        // }
+        if (tasks.size() >= std::thread::hardware_concurrency()) {
+            // processor_pool_t pool;
+            // for (const auto &[input, output] : tasks) {
+            //     pool.post(process_file, input, output);
+            // }
+            // has_failed = pool.has_error();
+            // 直接切分任务块，避免加锁抢任务
+            auto result = std::transform_reduce(
+                std::execution::par_unseq,
+                tasks.cbegin(),
+                tasks.cend(),
+                true,  // 初始值：没有错误
+                [](bool a, bool b) { return a && b; },  // 组合结果：只有当所有任务都成功时才成功
+                [](const auto &task) {
+                    return process_file(task.first, task.second) != processing_status::error;
+                }
+            );
+            has_failed = !result;
+        } else {
+            for (const auto &[input, output] : tasks) {
+                if (process_file(input, output) == processing_status::error) {
+                    has_failed = true;
+                }
             }
         }
         return has_failed ? processing_status::error : processing_status::success;
