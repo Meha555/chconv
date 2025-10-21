@@ -35,10 +35,17 @@ configure_file(
     @ONLY
 )
 
+find_package(Threads REQUIRED)
+
 set(chconv_srcs ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+set(chconv_libs ${CHARDET_LIB} ${ICONV_LIB} ${MAGIC_LIB} cmdline Threads::Threads)
+if (LINUX)
+    list(APPEND chconv_libs tbb)
+endif()
+
 add_executable(chconv ${chconv_srcs})
 target_include_directories(chconv PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${INCBIN_INCLUDE_DIRS})
-target_link_libraries(chconv PRIVATE ${CHARDET_LIB} ${ICONV_LIB} cmdline ${MAGIC_LIB})
+target_link_libraries(chconv PRIVATE ${chconv_libs})
 target_compile_definitions(chconv PRIVATE MAGIC_MGC_FILE="${MAGIC_MGC_FILE}")
 if(EMBED_MAGIC_MGC_FILE)
     target_compile_definitions(chconv PRIVATE EMBED_MAGIC_MGC_FILE)
