@@ -1,10 +1,10 @@
 #include <cstdarg>
 #include <cstring>
 #include <errno.h>
+#include <execution>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <execution>
 #include <numeric>
 #include <optional>
 #include <regex>
@@ -22,7 +22,20 @@ namespace fs = std::filesystem;
 
 INCBIN(magic_database_buffer, "../misc/magic.mgc"); // MAGIC_MGC_FILE
 
+#define EXT_CONVERTED ".converted"
+#define EXT_BACKUP ".bak"
+
 static std::atomic_uint64_t g_processed_files = 0;
+static struct
+{
+    std::vector<std::pair<fs::path, fs::path>> files; // <src, dst>
+    std::mutex mtx;
+    void append(const fs::path &src, const fs::path &dst)
+    {
+        std::lock_guard lck(mtx);
+        files.emplace_back(src, dst);
+    }
+} g_skipped_files;
 
 template<typename Type, typename Ctor, typename Dtor>
 struct resource_guard_t
@@ -227,6 +240,7 @@ static struct options
     bool verbose = false;
     bool dry_run = false;
     bool recursive = false;
+    bool force = false;
     fs::path input;
     fs::path output;
     std::optional<regex_pairs> suffix;
@@ -241,7 +255,8 @@ static struct options
         parser.introduction("file encoding converter");
         parser.flag("verbose", 'v', "print verbose output");
         parser.flag("recursive", 'r', "process directories recursively");
-        parser.flag("dry-run", 'd', "just print files to be converted and do noting");
+        parser.flag("dry-run", 'd', "just print files to be EXT_CONVERTED and do noting");
+        parser.flag("force", 'f', "overrite if file already existing when output");
         parser.option<std::string>("input", 'i', "input filename or directory", true);
         parser.option<std::string>("output", 'o', "output filename or directory", true);
         parser.option<std::string>("suffix", 's', cmdline::description("included file suffixes", "matched by regex or string and split by ';'"), false);
@@ -263,6 +278,7 @@ static struct options
         verbose = parser.exist("verbose");
         recursive = parser.exist("recursive");
         dry_run = parser.exist("dry-run");
+        force = parser.exist("force");
         // required options
         input = parser.get<std::string>("input");
         output = parser.get<std::string>("output");
@@ -408,6 +424,7 @@ static std::string detect_encoding(const fs::path &filename)
     if (!file.read(buffer.data(), size)) {
         throw std::runtime_error("failed to read: " + filename.string());
     }
+    file.close();
 
     // NOTE uchardet_reset的调用会修改uchardet_get_charset返回的字符串地址，
     // 所以在使用uchardet_get_charset返回的临时地址时，不能调用uchardet_reset
@@ -426,18 +443,28 @@ static std::string detect_encoding(const fs::path &filename)
 
 static bool convert_encoding(const fs::path &input_filename,
                              const std::string &from_encoding,
-                             const fs::path &output_filename,
+                             fs::path output_filename,
                              const std::string &to_encoding)
 {
     std::osyncstream serr(std::cerr);
 
-    // 如果源编码和目标编码相同，则直接复制文件
+    // 如果源编码和目标编码相同，则无需转码
     if (from_encoding == to_encoding) {
         try {
-            if (input_filename != output_filename)
-                fs::copy_file(input_filename, output_filename, fs::copy_options::overwrite_existing);
+            if (input_filename != output_filename) {
+                // 如果输出位置已有同名文件，且策略是不要替换，则生成.converted文件
+                if (fs::exists(output_filename) && !g.force) {
+                    output_filename.concat(EXT_CONVERTED);
+                    g_skipped_files.append(input_filename, output_filename);
+                    fs::copy_file(input_filename, output_filename);
+                }
+                // 否则直接替换即可
+                else {
+                    fs::copy_file(input_filename, output_filename, fs::copy_options::overwrite_existing);
+                }
+            }
             return true;
-        } catch (const fs::filesystem_error& ex) {
+        } catch (const fs::filesystem_error &ex) {
             serr << "copy " << input_filename << "(" << from_encoding << ") -> " << output_filename << "(" << to_encoding << ") failed: " << ex.what() << '\n';
             return false;
         }
@@ -458,6 +485,7 @@ static bool convert_encoding(const fs::path &input_filename,
         serr << "failed to read: " << input_filename << '\n';
         return false;
     }
+    input_file.close();
 
     iconv_t cd = iconv_open(to_encoding.c_str(), from_encoding.c_str());
     if (cd == (iconv_t)-1) {
@@ -483,6 +511,17 @@ static bool convert_encoding(const fs::path &input_filename,
 
     iconv_close(cd);
 
+    bool is_same_file = input_filename == output_filename; // fs::equivalent(input_filename, output_filename, ec)
+    fs::path bak_input_filename = input_filename;
+    bak_input_filename += EXT_BACKUP;
+
+    if (is_same_file) {
+        fs::rename(input_filename, bak_input_filename);
+    } else if (fs::exists(output_filename) && !g.force) {
+        output_filename.concat(EXT_CONVERTED);
+        g_skipped_files.append(input_filename, output_filename);
+    }
+
     std::ofstream output_file(output_filename, std::ios::binary);
     if (!output_file.is_open()) {
         serr << "cannot open file: " << output_filename << '\n';
@@ -490,6 +529,17 @@ static bool convert_encoding(const fs::path &input_filename,
     }
 
     output_file.write(output_buffer.data(), output_buffer_size - out_left);
+
+    if (is_same_file) {
+        if (output_file.good()) {
+            fs::remove(bak_input_filename);
+        } else {
+            serr << "write " << output_filename << " failed."
+                 << " state: " << output_file.exceptions()
+                 << " error:" << std::strerror(errno) << "(" << errno << ")\n";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -567,7 +617,7 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
                     // has_processed_file = true;
                     // keep the relative directory structure
                     const fs::path rel_dir = fs::relative(input_dirs[i], g.input);
-                    const fs::path target_path = output_dir / rel_dir / relative_path;
+                    const fs::path target_path = fs::weakly_canonical(output_dir / rel_dir / relative_path);
                     // 这里还是要改成线程池，不能简单起个线程就完事了，不然没法复用magic_t和uchardet_t句柄
                     // futures.emplace_back(std::async(std::launch::async, process_file, entry.path(), target_path));
                     tasks.emplace_back(entry.path(), target_path);
@@ -599,12 +649,13 @@ static processing_status process_directory(const fs::path &input_dir, const fs::
                 std::execution::par_unseq,
                 tasks.cbegin(),
                 tasks.cend(),
-                true,  // 初始值：没有错误
-                [](bool a, bool b) { return a && b; },  // 组合结果：只有当所有任务都成功时才成功
+                true, // 初始值：没有错误
+                [](bool a, bool b) {
+                    return a && b;
+                }, // 组合结果：只有当所有任务都成功时才成功
                 [](const auto &task) {
                     return process_file(task.first, task.second) != processing_status::error;
-                }
-            );
+                });
             has_failed = !result;
         } else {
             for (const auto &[input, output] : tasks) {
@@ -627,8 +678,8 @@ int main(int argc, char *argv[])
         g.init(argc, argv);
         std::cout << "convert start...\n";
 
-        g.input = fs::absolute(g.input);
-        g.output = fs::absolute(g.output);
+        g.input = fs::weakly_canonical(g.input);
+        g.output = fs::weakly_canonical(g.output);
 
         if (!fs::exists(g.input)) {
             std::cerr << "input file or directory does not exist: " << g.input << '\n';
@@ -643,6 +694,13 @@ int main(int argc, char *argv[])
         } else {
             if (process_file(g.input, g.output) == processing_status::error) {
                 has_failed = true;
+            }
+        }
+
+        if (!g_skipped_files.files.empty()) {
+            std::cerr << "Skipped files:\n";
+            for (const auto &[src, dst] : g_skipped_files.files) {
+                std::cerr << "  " << src << " -> " << dst << '\n';
             }
         }
 
