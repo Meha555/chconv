@@ -4,4 +4,7 @@ FetchContent_Declare(
     GIT_TAG 1.0.0
     GIT_SHALLOW 1
 )
+
+option(BUILD_EXAMPLES "Build cmdline examples" OFF)
+
 FetchContent_MakeAvailable(cmdline)

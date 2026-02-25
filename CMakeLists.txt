@@ -14,6 +14,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/out)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 # 启用 CMP0135 新行为：解压文件的时间戳设为解压时的当前时间
 cmake_policy(SET CMP0135 NEW)
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
 if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "Clang" OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
@@ -39,7 +40,7 @@ find_package(Threads REQUIRED)
 
 set(chconv_srcs ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 set(chconv_libs ${CHARDET_LIB} ${ICONV_LIB} ${MAGIC_LIB} cmdline Threads::Threads)
-if (LINUX)
+if(LINUX)
     list(APPEND chconv_libs tbb)
 endif()
 
