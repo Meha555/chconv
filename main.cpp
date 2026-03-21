@@ -256,7 +256,7 @@ static struct options
         parser.flag("verbose", 'v', "print verbose output");
         parser.flag("recursive", 'r', "process directories recursively");
         parser.flag("dry-run", 'd', "just print files to be converted and do noting");
-        parser.flag("force", 'f', "overrite if file already existing when output");
+        parser.flag("force", 'f', "overwrite if file already exists when output");
         parser.option<std::string>("input", 'i', "input filename or directory", true);
         parser.option<std::string>("output", 'o', "output filename or directory", true);
         parser.option<std::string>("suffix", 's', cmdline::description("included file suffixes", "matched by regex or string list split by ';'"), false);
@@ -549,7 +549,7 @@ static processing_status process_file(const fs::path &input_path, const fs::path
     std::osyncstream serr(std::cerr);
     try {
         // Check suffix if specified
-        if (!should_include_suffix(g.input)) {
+        if (!should_include_suffix(input_path)) {
             return processing_status::skip;
         }
         // skip non-text file
