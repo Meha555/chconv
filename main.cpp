@@ -255,12 +255,12 @@ static struct options
         parser.introduction("file encoding converter");
         parser.flag("verbose", 'v', "print verbose output");
         parser.flag("recursive", 'r', "process directories recursively");
-        parser.flag("dry-run", 'd', "just print files to be EXT_CONVERTED and do noting");
+        parser.flag("dry-run", 'd', "just print files to be converted and do noting");
         parser.flag("force", 'f', "overrite if file already existing when output");
         parser.option<std::string>("input", 'i', "input filename or directory", true);
         parser.option<std::string>("output", 'o', "output filename or directory", true);
-        parser.option<std::string>("suffix", 's', cmdline::description("included file suffixes", "matched by regex or string and split by ';'"), false);
-        parser.option<std::string>("exclude", 'e', cmdline::description("excluded filenames, suffixes or dirs", "matched by regex or string and split by ';'"), false);
+        parser.option<std::string>("suffix", 's', cmdline::description("included file suffixes", "matched by regex or string list split by ';'"), false);
+        parser.option<std::string>("exclude", 'e', cmdline::description("excluded filenames, suffixes or dirs", "matched by regex or string list split by ';'"), false);
         parser.option_with_default<std::string>("to", 't',
             cmdline::description(
                 "encoding of output file",
