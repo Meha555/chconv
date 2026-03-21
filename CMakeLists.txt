@@ -94,3 +94,41 @@ add_custom_command(
     ${CMAKE_CURRENT_SOURCE_DIR}/test
     ${CMAKE_CURRENT_BINARY_DIR}/test
 )
+
+# 安装配置
+install(TARGETS chconv
+    RUNTIME DESTINATION bin
+)
+
+# 安装依赖库
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/out/uchardet.dll
+    ${CMAKE_CURRENT_SOURCE_DIR}/out/magic-1.dll
+    ${CMAKE_CURRENT_SOURCE_DIR}/out/tre.dll
+    DESTINATION bin
+)
+
+# 安装magic.mgc文件
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/misc/magic.mgc
+    DESTINATION bin
+)
+
+# 安装README文件
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/README.md
+    ${CMAKE_CURRENT_SOURCE_DIR}/README_zh.md
+    DESTINATION doc
+)
+
+# CPack 配置
+set(CPACK_PACKAGE_NAME "chconv")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_DESCRIPTION "File encoding converter")
+set(CPACK_PACKAGE_VENDOR "chconv")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "chconv")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+
+include(cmake/PackNSIS.cmake)
+include(CPack)
