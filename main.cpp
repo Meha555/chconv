@@ -436,7 +436,7 @@ static std::string detect_encoding(const fs::path &filename)
 
     const char *encoding = uchardet_get_charset(cd);
     if (std::strcmp(encoding, "") == 0) {
-        throw std::runtime_error("unrecognized encoding of file: " + filename.string());
+        throw std::runtime_error("unrecognized encoding of file: " + filename.string() + ", maybe it is too short to guess charset?");
     }
     return encoding;
 }
@@ -570,7 +570,9 @@ static processing_status process_file(const fs::path &input_path, const fs::path
             return processing_status::success;
         }
 
-        fs::create_directories(fs::path(output_path).parent_path());
+        if (output_path.has_parent_path()) {
+            fs::create_directories(output_path.parent_path());
+        }
 
         if (g.verbose) {
             sout << "converting: " << input_path << "(" << file_encoding << ") -> " << output_path << "(" << g.to.value() << ")\n";
