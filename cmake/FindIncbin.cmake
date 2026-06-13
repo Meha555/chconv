@@ -2,7 +2,7 @@ FetchContent_Declare(
     incbin
     GIT_REPOSITORY https://github.com/graphitemaster/incbin.git
     GIT_TAG main
-    GIT_SHALLOW 1
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(incbin)
 

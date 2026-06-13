@@ -26,10 +26,18 @@ chconv 是一个命令行工具，用于自动检测文件的字符编码并将�
 ### 基本语法
 
 ```bash
-chconv [选项] -i <输入文件/目录> -o <输出文件/目录>
+chconv guess <输入文件>
+chconv convert [选项] -i <输入文件/目录> -o <输出文件/目录>
 ```
 
-### 常用选项
+### 命令
+
+| 命令 | 描述 |
+|------|------|
+| guess | 检测并输出单个输入文件的编码 |
+| convert | 将单个文件或目录转换为目标编码 |
+
+### convert 常用选项
 
 | 选项 | 简写 | 描述 |
 |------|------|------|
@@ -46,27 +54,32 @@ chconv [选项] -i <输入文件/目录> -o <输出文件/目录>
 
 1. 转换单个文件到 UTF-8：
    ```bash
-   chconv -i input.txt -o output.txt
+   chconv convert -i input.txt -o output.txt
    ```
 
 2. 将整个目录中的文件转换为 GBK 编码：
    ```bash
-   chconv -r -t GBK -i ./source_dir -o ./target_dir
+   chconv convert -r -t GBK -i ./source_dir -o ./target_dir
    ```
 
 3. 仅转换 .log 文件：
    ```bash
-   chconv -r -s .log -i ./logs -o ./converted_logs
+   chconv convert -r -s .log -i ./logs -o ./converted_logs
    ```
 
 4. 试运行模式（预览操作但不实际转换）：
    ```bash
-   chconv -r -d -i ./source -o ./target
+   chconv convert -r -d -i ./source -o ./target
    ```
 
 5. 使用正则表达式转换文件时排除特定文件、后缀或目录：
    ```bash
-   chconv -r --exclude ".*\.log$|.*\.tmp$|node_modules|\.git" -i ./source_dir -o ./target_dir
+   chconv convert -r --exclude ".*\.log$|.*\.tmp$|node_modules|\.git" -i ./source_dir -o ./target_dir
+   ```
+
+6. 仅检测文件编码，不执行转换：
+   ```bash
+   chconv guess input.txt
    ```
 
 ### 正则表达式使用说明

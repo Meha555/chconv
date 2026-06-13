@@ -28,10 +28,18 @@ chconv is a command-line tool for automatically detecting file character encodin
 ### Basic Syntax
 
 ```bash
-chconv [options] -i <input file/directory> -o <output file/directory>
+chconv guess <input file>
+chconv convert [options] -i <input file/directory> -o <output file/directory>
 ```
 
-### Common Options
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| guess | Detect and print the encoding of one input file |
+| convert | Convert one file or a directory to the target encoding |
+
+### Convert Options
 
 | Option | Short | Description |
 |--------|-------|-------------|
@@ -48,27 +56,32 @@ chconv [options] -i <input file/directory> -o <output file/directory>
 
 1. Convert a single file to UTF-8:
    ```bash
-   chconv -i input.txt -o output.txt
+   chconv convert -i input.txt -o output.txt
    ```
 
 2. Convert files in an entire directory to GBK encoding:
    ```bash
-   chconv -r -t GBK -i ./source_dir -o ./target_dir
+   chconv convert -r -t GBK -i ./source_dir -o ./target_dir
    ```
 
 3. Convert only .log files:
    ```bash
-   chconv -r -s .log -i ./logs -o ./converted_logs
+   chconv convert -r -s .log -i ./logs -o ./converted_logs
    ```
 
 4. Dry-run mode (preview operations without actual conversion):
    ```bash
-   chconv -r -d -i ./source -o ./target
+   chconv convert -r -d -i ./source -o ./target
    ```
 
 5. Convert files while excluding specific files, suffixes or directories using regular expressions:
    ```bash
-   chconv -r --exclude ".*\.log$|.*\.tmp$|node_modules|\.git" -i ./source_dir -o ./target_dir
+   chconv convert -r --exclude ".*\.log$|.*\.tmp$|node_modules|\.git" -i ./source_dir -o ./target_dir
+   ```
+
+6. Detect a file encoding without converting it:
+   ```bash
+   chconv guess input.txt
    ```
 
 ### Regular Expression Usage
